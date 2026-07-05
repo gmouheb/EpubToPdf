@@ -109,6 +109,16 @@ If this command fails, the app conversion will fail too. Fix the Calibre install
 
 Manual MVP test cases are listed in [`TEST_SCENARIOS.md`](./TEST_SCENARIOS.md).
 
+## Current Features
+
+- Convert up to 3 EPUB files in one batch
+- Run up to 3 Calibre conversions in parallel by default
+- Limit each client IP to 3 conversion starts per wait window
+- Configure the IP wait window in minutes or seconds
+- Download each completed PDF independently
+- Delete uploaded EPUB and generated PDF files after successful download
+- Clean up abandoned temporary files on a retention schedule
+
 ## Environment Variables
 
 The app works with defaults, but you can override them in `.env.local`.
@@ -168,6 +178,18 @@ How long a client IP must wait before its conversion limit resets. Default: `30`
 
 Optional override for the same wait duration in seconds. If this is set, it takes priority over `IP_CONVERSION_LIMIT_WINDOW_MINUTES`. Useful for testing, for example `IP_CONVERSION_LIMIT_WINDOW_SECONDS=60`.
 
+Example for a 5-minute IP wait:
+
+```env
+IP_CONVERSION_LIMIT_WINDOW_MINUTES=5
+```
+
+Example for a 30-second local test:
+
+```env
+IP_CONVERSION_LIMIT_WINDOW_SECONDS=30
+```
+
 `POST_DOWNLOAD_CLEANUP_SECONDS`
 
 After a successful PDF download stream closes, the app waits this many seconds, then deletes the uploaded EPUB, generated PDF, and in-memory job record. Default: `8`.
@@ -179,15 +201,31 @@ Optional absolute path to `ebook-convert`. Use this when Calibre is installed bu
 ## How The App Works
 
 1. The user selects up to three `.epub` files and PDF settings in the browser.
-2. The frontend posts multipart form data to `POST /api/convert`.
-3. The server validates the file extension, MIME type where available, and size.
-4. The server stores the upload using a UUID filename, not the original filename.
-5. A local in-memory job is created with a timestamped download name based on the original EPUB name.
-6. The queue runs Calibre with `spawn`, using safe CLI arguments instead of shell command strings.
-7. The frontend polls `GET /api/jobs/:id`.
-8. When the job is complete, the frontend shows a download button.
-9. `GET /api/download/:id` streams the PDF.
-10. After the download stream closes, the app deletes the uploaded EPUB and generated PDF after 8 seconds by default.
+2. The frontend sends each file as its own multipart request to `POST /api/convert`.
+3. The server checks the client IP rate limit before creating a job.
+4. The server validates the file extension, MIME type where available, and size.
+5. The server stores the upload using a UUID filename, not the original filename.
+6. A local in-memory job is created with a timestamped download name based on the original EPUB name.
+7. The queue runs Calibre with `spawn`, using safe CLI arguments instead of shell command strings.
+8. The frontend polls `GET /api/jobs/:id` for each file.
+9. When a job is complete, the frontend shows a download button for that PDF.
+10. `GET /api/download/:id` streams the PDF using a Web stream.
+11. After the download stream ends or closes, the app schedules deletion of the uploaded EPUB and generated PDF after 8 seconds by default.
+
+## Client IP Conversion Limit
+
+By default, one client IP can start 3 conversion jobs per 30-minute window. This prevents one client from filling the server by repeatedly starting conversions.
+
+When the limit is reached, `POST /api/convert` returns HTTP `429` with a friendly message and a `Retry-After` header. The frontend shows that message to the user and tells them to wait.
+
+The app reads the client IP from:
+
+- `x-forwarded-for`
+- `x-real-ip`
+
+When deploying behind Nginx, the included config forwards these headers.
+
+This limiter is in-memory for the MVP. It resets when the server restarts and is not shared across multiple server instances. Use Redis or another shared store for multi-server production.
 
 ## PDF Settings
 
@@ -284,9 +322,19 @@ epub-to-pdf/
             route.ts
     components/
       UploadForm.tsx
-      ConversionSettings.tsx
-      ProgressStatus.tsx
-      DownloadResult.tsx
+      UploadDropzone.tsx
+      ConversionSettingsPanel.tsx
+      ConversionProgress.tsx
+      ConversionResult.tsx
+      ConversionError.tsx
+      ui/
+        Alert.tsx
+        Button.tsx
+        Card.tsx
+        Checkbox.tsx
+        Input.tsx
+        ProgressSteps.tsx
+        Select.tsx
     lib/
       conversion/
         convertEpubToPdf.ts
@@ -299,6 +347,8 @@ epub-to-pdf/
         paths.ts
         cleanup.ts
         safeFilename.ts
+      rateLimit/
+        ipConversionLimit.ts
     types/
       conversion.ts
   uploads/
@@ -313,19 +363,27 @@ Main app page. It renders the product intro and upload/conversion tool.
 
 `src/components/UploadForm.tsx`
 
-Client component that handles file selection, client-side validation, upload submission, polling, and displaying results.
+Client component that handles batch file selection, client-side validation, upload submission, per-job polling, retry, and displaying download results.
 
-`src/components/ConversionSettings.tsx`
+`src/components/UploadDropzone.tsx`
+
+Drag-and-drop and file picker component for selecting up to 3 EPUB files.
+
+`src/components/ConversionSettingsPanel.tsx`
 
 Settings controls for page size, margins, font options, cover preservation, and image preservation.
 
-`src/components/ProgressStatus.tsx`
+`src/components/ConversionProgress.tsx`
 
 Displays upload, queue, conversion, complete, and failed states.
 
-`src/components/DownloadResult.tsx`
+`src/components/ConversionResult.tsx`
 
-Shows the PDF download button when conversion completes.
+Shows the PDF download action and converted file information.
+
+`src/components/ConversionError.tsx`
+
+Displays friendly conversion errors.
 
 ## Backend Modules
 
@@ -357,6 +415,10 @@ Deletes old temporary files on a retention schedule and deletes downloaded job f
 
 Sanitizes original filenames for validation and display purposes. The app still stores files by UUID.
 
+`src/lib/rateLimit/ipConversionLimit.ts`
+
+Tracks how many conversion jobs each client IP has started in the current wait window. Returns a friendly retry message and `Retry-After` timing when the client is blocked.
+
 ## Security Notes
 
 - Uploads are stored outside `public`.
@@ -369,6 +431,8 @@ Sanitizes original filenames for validation and display purposes. The app still 
 - CLI arguments are passed as an array, not interpolated into a shell string.
 - Invalid file types, empty files, and oversized files are rejected.
 - A client IP can start up to 3 conversions per 30-minute window by default.
+- Blocked IPs receive HTTP `429` and a `Retry-After` header.
+- The IP limiter is in-memory for the MVP and should be moved to a shared store for multi-instance production.
 - DRM bypass is not supported.
 - Conversion errors are logged server-side, while user-facing messages remain generic.
 
@@ -426,6 +490,30 @@ Then restart the dev server.
 
 The generated PDF may have already been cleaned up. Convert the EPUB again.
 
+### IP conversion limit reached
+
+If a user sees a message asking them to wait, they have reached the per-IP conversion limit.
+
+To change the number of conversions:
+
+```env
+IP_CONVERSION_LIMIT_MAX_FILES=3
+```
+
+To change the wait time:
+
+```env
+IP_CONVERSION_LIMIT_WINDOW_MINUTES=30
+```
+
+or:
+
+```env
+IP_CONVERSION_LIMIT_WINDOW_SECONDS=1800
+```
+
+Restart the server after changing `.env.local`.
+
 ## Known Limitations
 
 - Reflowable EPUBs are repaginated into the selected PDF size.
@@ -433,7 +521,7 @@ The generated PDF may have already been cleaned up. Convert the EPUB again.
 - Fixed-layout EPUB fidelity depends on Calibre support for the specific EPUB.
 - The MVP uses a local in-memory queue, so jobs do not survive process restarts.
 - The MVP uses local disk storage, not cloud storage.
-- Batch conversion is not implemented yet.
+- The IP conversion limit is in-memory and resets on server restart.
 - Metadata and cover preview are not implemented yet.
 
 ## Phase 2 Ideas
@@ -443,7 +531,6 @@ The generated PDF may have already been cleaned up. Convert the EPUB again.
 - Table of contents preview
 - Custom margins
 - Page orientation
-- Batch conversion
 - Conversion history
 - Authentication
 - Cloud storage
