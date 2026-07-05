@@ -120,7 +120,10 @@ MAX_FILE_SIZE_BYTES=104857600
 CONVERSION_TIMEOUT_SECONDS=300
 CLEANUP_INTERVAL_MINUTES=10
 JOB_RETENTION_MINUTES=60
-MAX_CONCURRENT_CONVERSIONS=1
+MAX_CONCURRENT_CONVERSIONS=3
+IP_CONVERSION_LIMIT_MAX_FILES=3
+IP_CONVERSION_LIMIT_WINDOW_MINUTES=30
+# IP_CONVERSION_LIMIT_WINDOW_SECONDS=1800
 POST_DOWNLOAD_CLEANUP_SECONDS=8
 CALIBRE_BINARY=/usr/bin/ebook-convert
 ```
@@ -151,7 +154,19 @@ How long abandoned uploads and outputs can remain before retention cleanup delet
 
 `MAX_CONCURRENT_CONVERSIONS`
 
-How many conversions can run at the same time in the local queue. Default: `1`.
+How many conversions can run at the same time in the local queue. Default: `3`.
+
+`IP_CONVERSION_LIMIT_MAX_FILES`
+
+How many EPUB conversion jobs one client IP can start during the rate-limit window. Default: `3`.
+
+`IP_CONVERSION_LIMIT_WINDOW_MINUTES`
+
+How long a client IP must wait before its conversion limit resets. Default: `30`.
+
+`IP_CONVERSION_LIMIT_WINDOW_SECONDS`
+
+Optional override for the same wait duration in seconds. If this is set, it takes priority over `IP_CONVERSION_LIMIT_WINDOW_MINUTES`. Useful for testing, for example `IP_CONVERSION_LIMIT_WINDOW_SECONDS=60`.
 
 `POST_DOWNLOAD_CLEANUP_SECONDS`
 
@@ -163,7 +178,7 @@ Optional absolute path to `ebook-convert`. Use this when Calibre is installed bu
 
 ## How The App Works
 
-1. The user selects an `.epub` file and PDF settings in the browser.
+1. The user selects up to three `.epub` files and PDF settings in the browser.
 2. The frontend posts multipart form data to `POST /api/convert`.
 3. The server validates the file extension, MIME type where available, and size.
 4. The server stores the upload using a UUID filename, not the original filename.
@@ -353,6 +368,7 @@ Sanitizes original filenames for validation and display purposes. The app still 
 - Calibre is called with `spawn`, not `exec`.
 - CLI arguments are passed as an array, not interpolated into a shell string.
 - Invalid file types, empty files, and oversized files are rejected.
+- A client IP can start up to 3 conversions per 30-minute window by default.
 - DRM bypass is not supported.
 - Conversion errors are logged server-side, while user-facing messages remain generic.
 

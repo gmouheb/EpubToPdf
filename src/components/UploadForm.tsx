@@ -1,16 +1,14 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
-import ConversionError from "./ConversionError";
-import ConversionProgress from "./ConversionProgress";
-import ConversionResult from "./ConversionResult";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import ConversionSettingsPanel from "./ConversionSettingsPanel";
-import UploadDropzone from "./UploadDropzone";
-import { Button } from "./ui/Button";
+import UploadDropzone, { formatFileSize } from "./UploadDropzone";
+import { Button, ButtonLink } from "./ui/Button";
 import Card from "./ui/Card";
 import { ConversionSettings as Settings, JobStatus } from "@/types/conversion";
 
 const maxFileSize = 100 * 1024 * 1024;
+const maxBatchFiles = 3;
 
 const defaultSettings: Settings = {
   pageSize: "a4",
@@ -27,104 +25,149 @@ interface JobResponse {
   error?: string;
 }
 
-export default function UploadForm() {
-  const [file, setFile] = useState<File | null>(null);
-  const [settings, setSettings] = useState<Settings>(defaultSettings);
-  const [status, setStatus] = useState<JobStatus | "uploading" | null>(null);
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [downloadUrl, setDownloadUrl] = useState<string | undefined>();
-  const [error, setError] = useState<string | undefined>();
-  const pollRef = useRef<number | null>(null);
+interface BatchItem {
+  localId: string;
+  file: File;
+  status: JobStatus | "uploading" | null;
+  jobId?: string;
+  downloadUrl?: string;
+  error?: string;
+}
 
-  const busy = status === "uploading" || status === "queued" || status === "converting";
-  const complete = status === "complete" && Boolean(file && downloadUrl);
-  const failed = status === "failed";
+export default function UploadForm() {
+  const [items, setItems] = useState<BatchItem[]>([]);
+  const [settings, setSettings] = useState<Settings>(defaultSettings);
+  const [formError, setFormError] = useState<string | undefined>();
+
+  const busy = items.some((item) => item.status === "uploading" || item.status === "queued" || item.status === "converting");
+  const hasComplete = items.some((item) => item.status === "complete");
+  const allFinished = items.length > 0 && items.every((item) => item.status === "complete" || item.status === "failed");
+  const canConvert = items.length > 0 && !busy && !hasComplete;
+
+  const activeJobIds = useMemo(
+    () =>
+      items
+        .filter((item) => item.jobId && item.status !== "complete" && item.status !== "failed")
+        .map((item) => item.jobId as string),
+    [items]
+  );
 
   useEffect(() => {
-    if (!jobId || status === "complete" || status === "failed") {
+    if (activeJobIds.length === 0) {
       return;
     }
 
-    pollRef.current = window.setInterval(async () => {
-      try {
-        const response = await fetch(`/api/jobs/${jobId}`);
-        const data = (await response.json()) as JobResponse;
+    const interval = window.setInterval(async () => {
+      await Promise.all(
+        activeJobIds.map(async (jobId) => {
+          try {
+            const response = await fetch(`/api/jobs/${jobId}`);
+            const data = (await response.json()) as JobResponse;
 
-        if (!response.ok) {
-          throw new Error(data.error || "Unable to check conversion status.");
-        }
+            if (!response.ok) {
+              throw new Error(data.error || "Unable to check conversion status.");
+            }
 
-        setStatus(data.status);
-        setDownloadUrl(data.downloadUrl);
-        setError(data.error);
-
-        if (data.status === "complete" || data.status === "failed") {
-          if (pollRef.current) {
-            window.clearInterval(pollRef.current);
+            setItems((current) =>
+              current.map((item) =>
+                item.jobId === jobId
+                  ? {
+                      ...item,
+                      status: data.status,
+                      downloadUrl: data.downloadUrl,
+                      error: data.error
+                    }
+                  : item
+              )
+            );
+          } catch (pollError) {
+            setItems((current) =>
+              current.map((item) =>
+                item.jobId === jobId
+                  ? {
+                      ...item,
+                      status: "failed",
+                      error: pollError instanceof Error ? pollError.message : "Unable to check conversion status."
+                    }
+                  : item
+              )
+            );
           }
-        }
-      } catch (pollError) {
-        setStatus("failed");
-        setError(pollError instanceof Error ? pollError.message : "Unable to check conversion status.");
-      }
+        })
+      );
     }, 1500);
 
-    return () => {
-      if (pollRef.current) {
-        window.clearInterval(pollRef.current);
-      }
-    };
-  }, [jobId, status]);
+    return () => window.clearInterval(interval);
+  }, [activeJobIds]);
 
   function validateClientFile(selectedFile: File): string | undefined {
     if (!selectedFile.name.toLowerCase().endsWith(".epub")) {
-      return "Choose a file with the .epub extension.";
+      return `${selectedFile.name} is not an EPUB file.`;
     }
 
     if (selectedFile.size <= 0) {
-      return "The selected EPUB is empty.";
+      return `${selectedFile.name} is empty.`;
     }
 
     if (selectedFile.size > maxFileSize) {
-      return "The selected EPUB is larger than the 100 MB MVP limit.";
+      return `${selectedFile.name} is larger than the 100 MB limit.`;
     }
 
     return undefined;
   }
 
-  function handleFileChange(selectedFile: File | null) {
-    setDownloadUrl(undefined);
-    setJobId(null);
-    setStatus(null);
-    setError(undefined);
+  function handleFilesAdd(selectedFiles: File[]) {
+    setFormError(undefined);
 
-    if (!selectedFile) {
-      setFile(null);
+    if (busy) {
       return;
     }
 
-    const validationError = validateClientFile(selectedFile);
-    setError(validationError);
-    setFile(validationError ? null : selectedFile);
+    if (selectedFiles.length === 0) {
+      return;
+    }
+
+    const availableSlots = maxBatchFiles - items.length;
+    if (availableSlots <= 0) {
+      setFormError(`You can convert up to ${maxBatchFiles} EPUB files at once.`);
+      return;
+    }
+
+    const nextFiles = selectedFiles.slice(0, availableSlots);
+    const validationError = nextFiles.map(validateClientFile).find(Boolean);
+
+    if (validationError) {
+      setFormError(validationError);
+      return;
+    }
+
+    if (selectedFiles.length > availableSlots) {
+      setFormError(batchLimitMessage(nextFiles.length, selectedFiles.length - nextFiles.length));
+    }
+
+    setItems((current) => [
+      ...current,
+      ...nextFiles.map((file) => ({
+        localId: crypto.randomUUID(),
+        file,
+        status: null
+      }))
+    ]);
   }
 
-  async function startConversion() {
-    setError(undefined);
-    setDownloadUrl(undefined);
+  function handleFileRemove(index: number) {
+    setFormError(undefined);
+    setItems((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  }
 
-    if (!file) {
-      setError("Choose an EPUB file first.");
-      return;
-    }
-
-    const validationError = validateClientFile(file);
+  async function createConversionJob(item: BatchItem): Promise<{ jobId: string; status: JobStatus }> {
+    const validationError = validateClientFile(item.file);
     if (validationError) {
-      setError(validationError);
-      return;
+      throw new Error(validationError);
     }
 
     const formData = new FormData();
-    formData.append("file", file);
+    formData.append("file", item.file);
     formData.append("pageSize", settings.pageSize);
     formData.append("marginPreset", settings.marginPreset);
     formData.append("embedFonts", String(settings.embedFonts));
@@ -139,25 +182,78 @@ export default function UploadForm() {
       formData.append("fontSize", String(settings.fontSize));
     }
 
-    setStatus("uploading");
+    const response = await fetch("/api/convert", {
+      method: "POST",
+      body: formData
+    });
+    const data = (await response.json()) as {
+      jobId?: string;
+      status?: JobStatus;
+      error?: string;
+      retryAfterSeconds?: number;
+    };
 
-    try {
-      const response = await fetch("/api/convert", {
-        method: "POST",
-        body: formData
-      });
-      const data = (await response.json()) as { jobId?: string; status?: JobStatus; error?: string };
-
-      if (!response.ok || !data.jobId || !data.status) {
-        throw new Error(data.error || "Unable to start conversion.");
-      }
-
-      setJobId(data.jobId);
-      setStatus(data.status);
-    } catch (submitError) {
-      setStatus("failed");
-      setError(submitError instanceof Error ? submitError.message : "Unable to start conversion.");
+    if (!response.ok || !data.jobId || !data.status) {
+      throw new Error(errorMessageForResponse(response.status, data.error, data.retryAfterSeconds));
     }
+
+    return {
+      jobId: data.jobId,
+      status: data.status
+    };
+  }
+
+  async function startConversion(itemsToConvert = items) {
+    setFormError(undefined);
+
+    if (itemsToConvert.length === 0) {
+      setFormError("Choose at least one EPUB file first.");
+      return;
+    }
+
+    setItems((current) =>
+      current.map((item) => ({
+        ...item,
+        status: item.status === "complete" ? item.status : "uploading",
+        error: undefined,
+        downloadUrl: item.status === "complete" ? item.downloadUrl : undefined
+      }))
+    );
+
+    await Promise.all(
+      itemsToConvert.map(async (item) => {
+        if (item.status === "complete") {
+          return;
+        }
+
+        try {
+          const data = await createConversionJob(item);
+          setItems((current) =>
+            current.map((currentItem) =>
+              currentItem.localId === item.localId
+                ? {
+                    ...currentItem,
+                    jobId: data.jobId,
+                    status: data.status
+                  }
+                : currentItem
+            )
+          );
+        } catch (submitError) {
+          setItems((current) =>
+            current.map((currentItem) =>
+              currentItem.localId === item.localId
+                ? {
+                    ...currentItem,
+                    status: "failed",
+                    error: submitError instanceof Error ? submitError.message : "Unable to start conversion."
+                  }
+                : currentItem
+            )
+          );
+        }
+      })
+    );
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -165,46 +261,152 @@ export default function UploadForm() {
     await startConversion();
   }
 
+  function retryFailed() {
+    const retryItems = items
+      .filter((item) => item.status === "failed")
+      .map((item) => ({
+        ...item,
+        status: null,
+        jobId: undefined,
+        downloadUrl: undefined,
+        error: undefined
+      }));
+
+    setItems((current) =>
+      current.map((item) =>
+        item.status === "failed"
+          ? retryItems.find((retryItem) => retryItem.localId === item.localId) ?? item
+          : item
+      )
+    );
+    startConversion(retryItems);
+  }
+
   function resetForm() {
-    setFile(null);
-    setStatus(null);
-    setJobId(null);
-    setDownloadUrl(undefined);
-    setError(undefined);
+    setItems([]);
+    setFormError(undefined);
     setSettings(defaultSettings);
   }
 
   return (
     <form className="upload-form" onSubmit={handleSubmit}>
       <Card className="converter-card">
-        <UploadDropzone file={file} error={error && !failed ? error : undefined} disabled={busy} onFileChange={handleFileChange} />
+        <UploadDropzone
+          files={items.map((item) => item.file)}
+          error={formError}
+          disabled={busy}
+          maxFiles={maxBatchFiles}
+          onFilesAdd={handleFilesAdd}
+          onFileRemove={handleFileRemove}
+        />
 
         <ConversionSettingsPanel settings={settings} onChange={setSettings} disabled={busy} />
 
         <div className="form-actions">
-          <Button type="submit" disabled={busy || !file || complete}>
-            {busy ? "Conversion running" : "Convert to PDF"}
+          <Button type="submit" disabled={!canConvert}>
+            {busy ? "Conversions running" : `Convert ${items.length || ""} to PDF`}
           </Button>
           <p className="form-action-note">
-            Fixed-layout EPUBs can usually be preserved with high fidelity. Reflowable EPUBs are repaginated.
+            Convert up to {maxBatchFiles} EPUB files in parallel. Fixed-layout EPUBs can usually be preserved with high fidelity.
           </p>
         </div>
 
-        <ConversionProgress status={status} />
+        {items.length > 0 ? (
+          <section className="batch-panel" aria-live="polite">
+            <div className="section-heading">
+              <p className="section-kicker">Batch</p>
+              <h2>Conversion queue</h2>
+              <p>Each book is uploaded as its own job and can finish independently.</p>
+            </div>
 
-        {failed ? (
-          <ConversionError message={error} canRetry={Boolean(file) && !busy} onRetry={startConversion} />
-        ) : null}
+            <div className="batch-list">
+              {items.map((item) => (
+                <div className={`batch-item batch-item-${item.status ?? "ready"}`} key={item.localId}>
+                  <div>
+                    <h3>{item.file.name}</h3>
+                    <p>{formatFileSize(item.file.size)} · {statusLabel(item.status)}</p>
+                    {item.error ? <p className="batch-error">{item.error}</p> : null}
+                  </div>
+                  <div className="batch-actions">
+                    {item.downloadUrl ? (
+                      <ButtonLink href={item.downloadUrl}>Download PDF</ButtonLink>
+                    ) : null}
+                    {item.status === "failed" ? (
+                      <span className="status-chip status-chip-failed">Failed</span>
+                    ) : (
+                      <span className={`status-chip status-chip-${item.status ?? "ready"}`}>
+                        {statusLabel(item.status)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
 
-        {complete && file ? (
-          <ConversionResult
-            file={file}
-            settings={settings}
-            downloadUrl={downloadUrl}
-            onReset={resetForm}
-          />
+            {items.some((item) => item.status === "failed") ? (
+              <div className="result-actions">
+                <Button type="button" variant="secondary" disabled={busy} onClick={retryFailed}>
+                  Try failed again
+                </Button>
+              </div>
+            ) : null}
+
+            {allFinished ? (
+              <div className="result-actions">
+                <Button type="button" variant="secondary" onClick={resetForm}>
+                  Convert another batch
+                </Button>
+              </div>
+            ) : null}
+          </section>
         ) : null}
       </Card>
     </form>
   );
+}
+
+function statusLabel(status: BatchItem["status"]): string {
+  switch (status) {
+    case "uploading":
+      return "Uploading";
+    case "queued":
+      return "Preparing";
+    case "converting":
+      return "Converting";
+    case "complete":
+      return "Complete";
+    case "failed":
+      return "Failed";
+    default:
+      return "Ready";
+  }
+}
+
+function batchLimitMessage(addedCount: number, ignoredCount: number): string {
+  if (addedCount === 0) {
+    return "You can add up to 3 EPUB files at once. Remove a file before adding another.";
+  }
+
+  return `${addedCount} EPUB file${addedCount === 1 ? " was" : "s were"} added. ${ignoredCount} extra file${ignoredCount === 1 ? " was" : "s were"} ignored because the batch limit is 3.`;
+}
+
+function errorMessageForResponse(
+  status: number,
+  error?: string,
+  retryAfterSeconds?: number
+): string {
+  if (status === 429) {
+    if (error) {
+      return error;
+    }
+
+    const minutes = retryAfterSeconds ? Math.max(Math.ceil(retryAfterSeconds / 60), 1) : 30;
+    return `You have already started 3 conversions. Please wait about ${minutes} minute${minutes === 1 ? "" : "s"} before converting more files.`;
+  }
+
+  if (status >= 500) {
+    return "The converter could not start this job right now. Please try again in a moment.";
+  }
+
+  return error || "We could not convert this EPUB. Please check the file and try again.";
 }

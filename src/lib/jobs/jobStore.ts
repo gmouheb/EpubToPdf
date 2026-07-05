@@ -20,7 +20,7 @@ const store =
     activeCount: 0
   });
 
-const maxConcurrentConversions = Number(process.env.MAX_CONCURRENT_CONVERSIONS ?? 1);
+const maxConcurrentConversions = Number(process.env.MAX_CONCURRENT_CONVERSIONS ?? 3);
 const timeoutMs = Number(process.env.CONVERSION_TIMEOUT_SECONDS ?? 300) * 1000;
 
 export function createJob(

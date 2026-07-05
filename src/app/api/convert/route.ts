@@ -6,6 +6,7 @@ import { startCleanupJob } from "@/lib/files/cleanup";
 import { ensureStorageDirs, outputPathFor, uploadPathFor } from "@/lib/files/paths";
 import { buildTimestampedPdfFilename, safeFilename } from "@/lib/files/safeFilename";
 import { createJob } from "@/lib/jobs/jobStore";
+import { consumeIpConversionSlot, formatRetryMessage, getClientIp } from "@/lib/rateLimit/ipConversionLimit";
 import { ConversionSettings, MarginPreset, PageSize } from "@/types/conversion";
 
 export const runtime = "nodejs";
@@ -39,6 +40,23 @@ export async function POST(request: NextRequest) {
 
     if (file.type && file.type !== "application/epub+zip" && file.type !== "application/octet-stream") {
       return NextResponse.json({ error: "The uploaded file does not look like an EPUB." }, { status: 400 });
+    }
+
+    const rateLimit = consumeIpConversionSlot(getClientIp(request));
+    if (!rateLimit.allowed) {
+      return NextResponse.json(
+        {
+          error: formatRetryMessage(rateLimit.retryAfterSeconds),
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+          resetAt: new Date(rateLimit.resetAt).toISOString()
+        },
+        {
+          status: 429,
+          headers: {
+            "Retry-After": String(rateLimit.retryAfterSeconds)
+          }
+        }
+      );
     }
 
     const settings = parseSettings(formData);

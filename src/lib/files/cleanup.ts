@@ -56,6 +56,9 @@ export function scheduleDownloadedFileCleanup(
   setTimeout(() => {
     Promise.all(paths.map((filePath) => rm(filePath, { force: true })))
       .then(() => {
+        if (process.env.NODE_ENV !== "production") {
+          console.info(`Deleted downloaded files for job ${jobId}`);
+        }
         onComplete?.();
       })
       .catch((error) => {

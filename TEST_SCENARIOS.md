@@ -17,6 +17,27 @@ ebook-convert --version
 
 Expected result: A downloadable PDF is returned from `/api/download/:id`.
 
+## Parallel Batch Conversion
+
+1. Upload three valid `.epub` files under 100 MB each.
+2. Select the desired PDF settings.
+3. Click `Convert to PDF`.
+4. Watch the batch queue.
+
+Expected result: The app creates one job per file, shows each file independently, and returns a download button for each completed PDF. With `MAX_CONCURRENT_CONVERSIONS=3`, up to three Calibre conversions can run in parallel.
+
+## IP Conversion Limit
+
+1. Upload and start conversion for three valid `.epub` files.
+2. Try to start a fourth conversion from the same client IP before 30 minutes have passed.
+
+Expected result: The server returns HTTP `429`, and the frontend shows a friendly message telling the user they have reached the 3-conversion limit and should wait about 30 minutes.
+
+3. Wait for the configured `IP_CONVERSION_LIMIT_WINDOW_MINUTES` or `IP_CONVERSION_LIMIT_WINDOW_SECONDS` window to pass.
+4. Try converting another EPUB.
+
+Expected result: The limit resets and the new conversion can start.
+
 ## Page Size Options
 
 1. Convert the same EPUB with `A4`.
